@@ -40,7 +40,9 @@ local S = {
     autoFish = true,
     feedSlot = "1",
     fodderRarity = "Green (Basic)",
+    feedMaxKg = 100,
     autoFeed = false,
+    sellRarity = "Basic",
     autoBuy = false,
     autoClaim = true,
     autoLaunch = false,
@@ -56,7 +58,7 @@ local S = {
     _replayIdx = 1,
 }
 local SETTINGS = { "autoPlace", "replay", "autoUpgrade", "gameSpeed", "autoSkip", "autoVote",
-    "autoReturn", "autoReplay", "burst", "burstN", "burstMap", "upgradeMap", "difficulty", "autoFish", "feedSlot", "fodderRarity", "autoFeed", "autoBuy", "autoClaim", "autoLaunch", "autoReconnect", "antiAfk", "webhookLog", "launchMap" }
+    "autoReturn", "autoReplay", "burst", "burstN", "burstMap", "upgradeMap", "difficulty", "autoFish", "feedSlot", "fodderRarity", "feedMaxKg", "autoFeed", "sellRarity", "autoBuy", "autoClaim", "autoLaunch", "autoReconnect", "antiAfk", "webhookLog", "launchMap" }
 
 local Cleanup = { conns = {}, insts = {}, fns = {} }
 function Cleanup:conn(c) if c then self.conns[#self.conns + 1] = c end return c end
@@ -97,10 +99,21 @@ local function loadCfg(map)
 end
 loadCfg()
 S.persist = not (isfile and isfile("ftd_persist_off.txt"))
+local PERSIST_LOADER = 'if not (isfile and isfile("ftd_persist_off.txt")) then local ok,s=pcall(readfile,"ftdhub.luau") if ok and type(s)=="string" and #s>0 then loadstring(s)() end end'
+local function persist()
+    if not S.persist then return end
+    local q = queue_on_teleport or queueonteleport or (syn and syn.queue_on_teleport)
+    if q then pcall(function() q(PERSIST_LOADER) end) end
+end
 local function setPersist(on)
     S.persist = on
-    if on then pcall(function() if delfile then delfile("ftd_persist_off.txt") end end)
-    else pcall(function() if writefile then writefile("ftd_persist_off.txt", "1") end end) end
+    if on then
+        pcall(function() if delfile then delfile("ftd_persist_off.txt") end end)
+        persist()
+    else
+        pcall(function() if writefile then writefile("ftd_persist_off.txt", "1") end end)
+        pcall(function() local c = clear_teleport_queue or clearqueueonteleport if c then c() end end)
+    end
 end
 
 local function notify(txt)
@@ -338,23 +351,51 @@ local function previewFodder()
     local inst, id = feedTarget()
     notify("slot " .. tostring(S.feedSlot) .. ": Kg " .. tostring(inst and towerKg(inst) or "?") .. "\n" .. tostring(S.fodderRarity) .. " fodder = " .. #feedFodder(id or "__none__"))
 end
+local function feedCap() return tonumber(S.feedMaxKg) or FEED_TARGET_KG end
 local function feedStep()
     local inst, id = feedTarget()
     if not (inst and id and Util) then notify("no unit in slot " .. tostring(S.feedSlot)) S.autoFeed = false return end
     local kg = towerKg(inst)
-    if kg >= FEED_TARGET_KG then notify("slot " .. tostring(S.feedSlot) .. " reached Kg " .. kg) S.autoFeed = false return end
-    local fodder = feedFodder(id, 20)
-    if #fodder == 0 then notify("out of common fodder") S.autoFeed = false return end
+    if kg >= feedCap() then notify("slot " .. tostring(S.feedSlot) .. " reached Kg " .. kg) S.autoFeed = false return end
+    local fodder = feedFodder(id, 50)
+    if #fodder == 0 then notify("out of " .. tostring(S.fodderRarity) .. " fodder") S.autoFeed = false return end
     pcall(function() local rf = ev("AskFeed") if rf then rf:InvokeServer(id, fodder) end end)
-    task.wait(0.5)
+    task.wait(0.15)
     local after = towerKg(inst)
     if after <= kg then
         S._feedStall = (S._feedStall or 0) + 1
-        if S._feedStall >= 4 then notify("feed stalled at Kg " .. after) S.autoFeed = false end
+        if S._feedStall >= 5 then notify("feed stalled at Kg " .. after) S.autoFeed = false end
     else
         S._feedStall = 0
-        if math.floor(after / 10) > math.floor(kg / 10) then notify("feeding slot " .. tostring(S.feedSlot) .. ": Kg " .. after .. "/" .. FEED_TARGET_KG) end
+        if math.floor(after / 10) > math.floor(kg / 10) then notify("feeding slot " .. tostring(S.feedSlot) .. ": Kg " .. after .. "/" .. feedCap()) end
     end
+end
+local function sellByRarity(rarity)
+    local bp = findPath(LP, { "Data", "Backpack" })
+    local rf = ev("AskSell")
+    if not (bp and Data and Data.TOWERS and rf) then return 0 end
+    local eq = {}
+    local sf = findPath(LP, { "Data", "Slots" })
+    if sf then for _, c in ipairs(sf:GetChildren()) do eq[tostring(c.Value)] = true end end
+    local list = {}
+    for _, c in ipairs(bp:GetChildren()) do
+        if c:GetAttribute("kgExp") ~= nil then
+            local def = Data.TOWERS[tostring(c.Value)]
+            local trait = c:GetAttribute("trait")
+            if def and def.Rarity == rarity and not eq[c.Name] and (trait == nil or trait == "") then
+                list[#list + 1] = c.Name
+            end
+        end
+    end
+    local sold = 0
+    while #list > 0 do
+        local chunk = {}
+        for _ = 1, math.min(100, #list) do chunk[#chunk + 1] = table.remove(list) end
+        pcall(function() rf:InvokeServer(chunk) end)
+        sold = sold + #chunk
+        task.wait(0.2)
+    end
+    return sold
 end
 
 local function currentMap()
@@ -705,8 +746,13 @@ local function hubSpec()
         { section = "Feed", items = {
             { t = "dropdown", key = "feedSlot", label = "Feed slot", values = { "1", "2", "3", "4", "5" } },
             { t = "dropdown", key = "fodderRarity", label = "Fodder", values = { "Green (Basic)", "Blue (Rare)", "Purple (Epic)", "Red (Legendary)", "Everything" } },
-            { t = "toggle", key = "autoFeed", label = "Auto feed 100" },
+            { t = "slider", key = "feedMaxKg", label = "Feed to Kg", min = 10, max = 180 },
+            { t = "toggle", key = "autoFeed", label = "Auto feed" },
             { t = "button", label = "Preview fodder", fn = previewFodder },
+        } },
+        { section = "Sell", items = {
+            { t = "dropdown", key = "sellRarity", label = "Sell rarity", values = { "Basic", "Rare", "Epic", "Mythic", "Legendary", "Extinct", "Supreme" } },
+            { t = "button", label = "Sell all", fn = function() task.spawn(function() local n = sellByRarity(S.sellRarity) notify("sold " .. n .. " " .. tostring(S.sellRarity)) end) end },
         } },
         { section = "Launch", items = {
             { t = "dropdown", key = "launchMap", label = "Map", values = mapList() },
@@ -1059,6 +1105,7 @@ local function trackMatch()
 end
 
 local function runBattle()
+    persist()
     installAntiAfk()
     installReconnect()
     local tdir = workspace:WaitForChild("Towers", 10)
@@ -1112,6 +1159,7 @@ local function runBattle()
 end
 
 local function runHub()
+    persist()
     installAntiAfk()
     installReconnect()
     buildGui()
@@ -1152,7 +1200,7 @@ local function runHub()
         while not Cleanup._dead do
             if S.running and S.autoFeed then
                 pcall(feedStep)
-                task.wait(0.6)
+                task.wait(0.1)
             else
                 task.wait(1)
             end
