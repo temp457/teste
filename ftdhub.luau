@@ -49,6 +49,11 @@ local S = {
     autoReconnect = true,
     antiAfk = true,
     webhookLog = true,
+    blackScreen = false,
+    rerollSlot = "1",
+    rollPremium = false,
+    rollStop = "Rage Shot or MVP",
+    autoRoll = false,
     persist = true,
     launchMap = "The Bottom",
     macro = {},
@@ -58,7 +63,7 @@ local S = {
     _replayIdx = 1,
 }
 local SETTINGS = { "autoPlace", "replay", "autoUpgrade", "gameSpeed", "autoSkip", "autoVote",
-    "autoReturn", "autoReplay", "burst", "burstN", "burstMap", "upgradeMap", "difficulty", "autoFish", "feedSlot", "fodderRarity", "feedMaxKg", "autoFeed", "sellRarity", "autoBuy", "autoClaim", "autoLaunch", "autoReconnect", "antiAfk", "webhookLog", "launchMap" }
+    "autoReturn", "autoReplay", "burst", "burstN", "burstMap", "upgradeMap", "difficulty", "autoFish", "feedSlot", "fodderRarity", "feedMaxKg", "autoFeed", "sellRarity", "autoBuy", "autoClaim", "autoLaunch", "autoReconnect", "antiAfk", "webhookLog", "blackScreen", "rerollSlot", "rollPremium", "rollStop", "launchMap" }
 
 local Cleanup = { conns = {}, insts = {}, fns = {} }
 function Cleanup:conn(c) if c then self.conns[#self.conns + 1] = c end return c end
@@ -271,6 +276,7 @@ local WORMS = {
     { id = "BAIT_WORM", label = "Worm" },
     { id = "BAIT_ROYAL_WORM", label = "Royal" },
     { id = "BAIT_UNDERWORM", label = "Under" },
+    { id = "BAIT_SQUID_HEAD", label = "Squid" },
 }
 local function curOf(name)
     local ls = LP:FindFirstChild("leaderstats")
@@ -686,6 +692,158 @@ local function installReconnect()
     end)
 end
 
+local function getIC()
+    local Knit = req(findPath(RS, { "Shared", "Packages", "Knit" }))
+    return Knit and Knit.GetController and Knit.GetController("InterfaceController") or nil
+end
+local function openRerollSlot()
+    local IC = getIC()
+    if not (IC and type(IC._promptTraitRoll) == "function") then notify("reroll not available here") return end
+    local slots = findPath(LP, { "Data", "Slots" })
+    local s = slots and slots:FindFirstChild(tostring(S.rerollSlot))
+    if not (s and tostring(s.Value) ~= "") then notify("slot " .. tostring(S.rerollSlot) .. " empty") return end
+    local bp = findPath(LP, { "Data", "Backpack" })
+    local tower = bp and bp:FindFirstChild(tostring(s.Value))
+    if not (tower and tower.Parent) then notify("no tower in slot " .. tostring(S.rerollSlot)) return end
+    pcall(function() IC:_promptTraitRoll(tower) end)
+end
+local function rerollTower()
+    local slots = findPath(LP, { "Data", "Slots" })
+    local s = slots and slots:FindFirstChild(tostring(S.rerollSlot))
+    if not (s and tostring(s.Value) ~= "") then return nil end
+    local bp = findPath(LP, { "Data", "Backpack" })
+    local tw = bp and bp:FindFirstChild(tostring(s.Value))
+    return (tw and tw.Parent) and tw or nil
+end
+local function quickRoll(premium)
+    local tower = rerollTower()
+    if not tower then notify("slot " .. tostring(S.rerollSlot) .. " empty") return end
+    local rf = ev("AskTraitRoll")
+    if not rf then notify("AskTraitRoll missing") return end
+    local before = tower:GetAttribute("trait")
+    local ok, res = pcall(function() return rf:InvokeServer(tower.Name, premium and true or false) end)
+    if not (ok and res) then notify("roll failed (out of dice?)") return end
+    task.wait(0.2)
+    local tr = tower:GetAttribute("trait")
+    local shown = (tr and tr ~= "") and tr or "none"
+    local rar = "?"
+    pcall(function()
+        if Data and Data.TRAITS and Data.TRAITS.traits[tr] then rar = tostring(Data.TRAITS.traits[tr].Rarity) end
+    end)
+    notify(tostring(tower.Value) .. ":  " .. tostring((before and before ~= "") and before or "none") .. "  ->  " .. shown .. " [" .. rar .. "]")
+end
+local ROLL_STOP = {
+    ["Rage Shot or MVP"] = { ["Rage Shot"] = true, ["MVP"] = true },
+    ["Rage Shot"] = { ["Rage Shot"] = true },
+    ["MVP"] = { ["MVP"] = true },
+}
+local function rollTargetHit(tr)
+    if not tr or tr == "" then return false end
+    local mode = S.rollStop or "Rage Shot or MVP"
+    if mode == "Any Mythic+" then
+        local d = Data and Data.TRAITS and Data.TRAITS.traits and Data.TRAITS.traits[tr]
+        local r = d and d.Rarity
+        return r == "Mythic" or r == "Legendary"
+    end
+    local set = ROLL_STOP[mode]
+    return (set and set[tr]) and true or false
+end
+local function autoRollStep()
+    local tower = rerollTower()
+    if not tower then notify("slot " .. tostring(S.rerollSlot) .. " empty") S.autoRoll = false return end
+    local tr = tower:GetAttribute("trait")
+    if rollTargetHit(tr) then
+        notify("GOT IT: " .. tostring(tr) .. " on " .. tostring(tower.Value) .. " (" .. tostring(S._rolls or 0) .. " rolls)")
+        S.autoRoll = false
+        return
+    end
+    local rf = ev("AskTraitRoll")
+    if not rf then notify("AskTraitRoll missing") S.autoRoll = false return end
+    local ok, res = pcall(function() return rf:InvokeServer(tower.Name, S.rollPremium and true or false) end)
+    if not (ok and res) then
+        notify("stopped: out of dice? (" .. tostring(S._rolls or 0) .. " rolls)")
+        S.autoRoll = false
+        return
+    end
+    S._rolls = (S._rolls or 0) + 1
+    if S._rolls % 25 == 0 then
+        notify("rolling... " .. S._rolls .. " used, now: " .. tostring(tower:GetAttribute("trait")))
+    end
+end
+local function setBlack(on)
+    S.blackScreen = on
+    pcall(function() game:GetService("RunService"):Set3dRenderingEnabled(not on) end)
+    if on then
+        if not (S._blackGui and S._blackGui.Parent) then
+            local sg = Cleanup:inst(Instance.new("ScreenGui"))
+            sg.Name = "FTDBlack"
+            sg.ResetOnSpawn = false
+            sg.IgnoreGuiInset = true
+            sg.DisplayOrder = 2000000
+            pcall(function() sg.Parent = (gethui and gethui()) or LP:WaitForChild("PlayerGui") end)
+            local f = Instance.new("Frame")
+            f.Size = UDim2.fromScale(1, 1)
+            f.BackgroundColor3 = Color3.new(0, 0, 0)
+            f.BorderSizePixel = 0
+            f.Parent = sg
+            local hint = Instance.new("TextLabel")
+            hint.Size = UDim2.new(1, 0, 0, 22)
+            hint.Position = UDim2.new(0, 0, 1, -34)
+            hint.BackgroundTransparency = 1
+            hint.Text = "black screen on  -  RightCtrl to restore"
+            hint.TextColor3 = Color3.fromRGB(70, 70, 70)
+            hint.Font = Enum.Font.Gotham
+            hint.TextSize = 12
+            hint.Parent = f
+            S._blackGui = sg
+        end
+        S._blackGui.Enabled = true
+    elseif S._blackGui then
+        S._blackGui.Enabled = false
+    end
+    pcall(saveCfg)
+end
+local function installMisc()
+    if S._miscInstalled then return end
+    S._miscInstalled = true
+    Cleanup:add(function() pcall(function() game:GetService("RunService"):Set3dRenderingEnabled(true) end) end)
+    Cleanup:conn(UIS.InputBegan:Connect(function(inp, gpe)
+        if gpe then return end
+        if inp.KeyCode == Enum.KeyCode.RightControl then pcall(function() setBlack(not S.blackScreen) end) end
+    end))
+    if S.blackScreen then task.defer(function() pcall(function() setBlack(true) end) end) end
+    task.spawn(function()
+        while not Cleanup._dead do
+            if S.autoRoll then
+                pcall(autoRollStep)
+                task.wait(0.25)
+            else
+                task.wait(0.5)
+            end
+        end
+    end)
+end
+local function miscSpec()
+    return {
+        { section = "Screen", items = {
+            { t = "toggle", key = "blackScreen", label = "Black screen", onChange = setBlack },
+        } },
+        { section = "Trait reroll", items = {
+            { t = "dropdown", key = "rerollSlot", label = "Slot", values = { "1", "2", "3", "4", "5" } },
+            { t = "button", label = "Roll dice", fn = function() task.spawn(function() quickRoll(false) end) end },
+            { t = "button", label = "Roll premium", fn = function() task.spawn(function() quickRoll(true) end) end },
+            { t = "button", label = "Open reroll", fn = openRerollSlot },
+        } },
+        { section = "Auto roll", items = {
+            { t = "dropdown", key = "rollStop", label = "Stop on", values = { "Rage Shot or MVP", "Rage Shot", "MVP", "Any Mythic+" } },
+            { t = "toggle", key = "rollPremium", label = "Use premium" },
+            { t = "toggle", key = "autoRoll", label = "Auto roll", onChange = function(v)
+                if v then S._rolls = 0 notify("auto rolling slot " .. tostring(S.rerollSlot) .. " -> " .. tostring(S.rollStop)) end
+            end },
+        } },
+    }
+end
+
 local function battleSpec()
     local units, seen = {}, {}
     for _, name in pairs(loadout()) do
@@ -1014,7 +1172,7 @@ local function buildNative(title, tabs)
 end
 
 local function buildAllTabs()
-    return { { name = "Battle", spec = battleSpec() }, { name = "Hub", spec = hubSpec() } }
+    return { { name = "Battle", spec = battleSpec() }, { name = "Hub", spec = hubSpec() }, { name = "Misc", spec = miscSpec() } }
 end
 local function buildGui()
     local tabs = buildAllTabs()
@@ -1108,6 +1266,7 @@ local function runBattle()
     persist()
     installAntiAfk()
     installReconnect()
+    installMisc()
     local tdir = workspace:WaitForChild("Towers", 10)
     if tdir then Cleanup:conn(tdir.ChildAdded:Connect(watchTowerAdded)) end
     local t0 = os.clock()
@@ -1162,6 +1321,7 @@ local function runHub()
     persist()
     installAntiAfk()
     installReconnect()
+    installMisc()
     buildGui()
     S.running = true
     task.spawn(function()
